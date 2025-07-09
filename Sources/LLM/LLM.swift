@@ -2,7 +2,6 @@ import Foundation
 import llama
 @_exported import LLMMacros
 
-
 /// A token used by the language model.
 public typealias Token = llama_token
 
@@ -55,7 +54,7 @@ public actor LLMCore {
     
     private var sampler: UnsafeMutablePointer<llama_sampler>?
     
-    func setParameters(seed: UInt32? = nil, topK: Int32? = nil, topP: Float? = nil, temp: Float? = nil, repeatPenalty: Float? = nil, repetitionLookback: Int32? = nil) {
+    func setParameters(seed: UInt32? = nil, topK: Int32? = nil, topP: Float? = nil, temp: Float? = nil, repeatPenalty: Float? = nil, repetitionLookback: Int32? = nil) async {
         if let seed { self.seed = seed }
         if let topK { self.topK = topK }
         if let topP { self.topP = topP }
@@ -68,7 +67,7 @@ public actor LLMCore {
         }
     }
     
-    func setStopSequence(_ sequence: String?) {
+    func setStopSequence(_ sequence: String?) async {
         if let sequence {
             stopSequenceTokens = encode(sequence, shouldAddBOS: false)
         } else {
@@ -91,7 +90,21 @@ public actor LLMCore {
         llama_sampler_chain_add(sampler!, llama_sampler_init_dist(seed))
     }
     
-    public init(model: Model, path: [CChar], seed: UInt32, topK: Int32, topP: Float, temp: Float, repeatPenalty: Float, repetitionLookback: Int32, maxTokenCount: Int) throws {
+    public init(model: Model, path: [CChar], seed: UInt32, topK: Int32, topP: Float, temp: Float, repeatPenalty: Float, repetitionLookback: Int32, maxTokenCount: Int, nThreads: Int, nThreadsBatch: Int) throws {
+        // Validate parameters
+        guard maxTokenCount > 0 else {
+            throw LLMError.invalidParameters("maxTokenCount must be positive")
+        }
+        guard nThreads > 0 && nThreadsBatch > 0 else {
+            throw LLMError.invalidParameters("Thread counts must be positive")
+        }
+        guard topP > 0 && topP <= 1 else {
+            throw LLMError.invalidParameters("topP must be in (0, 1] range")
+        }
+        guard temp >= 0 else {
+            throw LLMError.invalidParameters("temp must be non-negative")
+        }
+        
         self.model = model
         self.vocab = llama_model_get_vocab(model)
         self.seed = seed
@@ -104,17 +117,18 @@ public actor LLMCore {
         self.totalTokenCount = Int(llama_vocab_n_tokens(vocab))
         
         var contextParams = llama_context_default_params()
-        let processorCount = Int32(ProcessInfo().processorCount)
+        
         contextParams.n_ctx = UInt32(maxTokenCount)
         contextParams.n_batch = contextParams.n_ctx
-        contextParams.n_threads = processorCount
-        contextParams.n_threads_batch = processorCount
-        self.params = contextParams
+        contextParams.n_threads = Int32(nThreads)
+        contextParams.n_threads_batch = Int32(nThreadsBatch)
+        contextParams.flash_attn = true
         
-        guard let context = llama_init_from_model(model, params) else {
+        guard let context = llama_init_from_model(model, contextParams) else {
             throw LLMError.contextCreationFailed
         }
         self.context = context
+        self.params = contextParams
         
         self.batch = llama_batch_init(Int32(maxTokenCount), 0, 1)
         
@@ -129,15 +143,16 @@ public actor LLMCore {
         }
     }
     
-    
     public func encode(_ text: String, shouldAddBOS: Bool = true, special: Bool = true) -> [Token] {
-        let count = Int32(text.cString(using: .utf8)!.count)
+        let cString = text.cString(using: .utf8)!
+        let count = Int32(cString.count)
         var tokenCount = count + 1
         let cTokens = UnsafeMutablePointer<llama_token>.allocate(capacity: Int(tokenCount))
         defer { cTokens.deallocate() }
         
         tokenCount = llama_tokenize(vocab, text, count, cTokens, tokenCount, shouldAddBOS, special)
-        let tokens = (0..<Int(tokenCount)).map { cTokens[$0] }
+        
+        let tokens = Array(UnsafeBufferPointer(start: cTokens, count: Int(tokenCount)))
         return tokens
     }
     
@@ -150,50 +165,86 @@ public actor LLMCore {
         var buffer: [CChar] = .init(repeating: 0, count: bufferLength)
         var actualLength = Int(llama_token_to_piece(vocab, token, &buffer, Int32(bufferLength), 0, false))
         
-        guard actualLength != 0 else { return "" }
+        guard actualLength != 0 else {
+            print("Warning: Failed to decode token \(token)")
+            return ""
+        }
         
         if actualLength < 0 {
             bufferLength = -actualLength
             buffer = .init(repeating: 0, count: bufferLength)
             actualLength = Int(llama_token_to_piece(vocab, token, &buffer, Int32(bufferLength), 0, false))
-            guard actualLength > 0 else { return "" }
+            guard actualLength > 0 else {
+                print("Warning: Failed to decode token \(token) on second attempt")
+                return ""
+            }
         }
         
         let validBuffer = Array(buffer.prefix(actualLength))
         let bytes = validBuffer.map { UInt8(bitPattern: $0) }
-        guard var decoded = String(bytes: bytes, encoding: .utf8) else { return "" }
+        guard var decoded = String(bytes: bytes, encoding: .utf8) else {
+            print("Warning: Invalid UTF-8 in token \(token)")
+            return ""
+        }
         
         if decoded.contains("\0") {
             decoded = decoded.filter { $0 != "\0" }
         }
         
-        tokenDecodeCache.setObject(decoded as NSString, forKey: NSNumber(value: token))
+        if !decoded.isEmpty {
+            tokenDecodeCache.setObject(decoded as NSString, forKey: NSNumber(value: token))
+        }
         
         return decoded
     }
     
-    
     func prepareContext(for input: String) -> Bool {
         guard !input.isEmpty else { return false }
-        
+
         currentTokenCount = 0
         tokenBuffer.removeAll()
-        
+
         var tokens = encode(input)
         if tokens.last == nullToken { tokens.removeLast() }
-        
-        let initialCount = tokens.count
-        guard maxTokenCount > initialCount else { return false }
-        
+        guard maxTokenCount > tokens.count else { return false }
+
         clearBatch()
-        for (i, token) in tokens.enumerated() {
-            addToBatch(token: token, pos: Int32(i), isLogit: i == initialCount - 1)
+        let chunkSize = Int(params.n_batch > 0 ? params.n_batch : 256)
+        var fed = 0
+        while fed < tokens.count {
+            let end = min(fed + chunkSize, tokens.count)
+            let chunk = tokens[fed..<end]
+            for (i, t) in chunk.enumerated() {
+                addToBatch(token: t, pos: Int32(currentTokenCount) + Int32(i), isLogit: (fed + i) == tokens.count - 1)
+            }
+            guard batch.n_tokens > 0, llama_decode(context, batch) == 0 else { return false }
+            clearBatch()
+            currentTokenCount += Int32(chunk.count)
+            fed = end
         }
-        guard llama_decode(context, batch) == 0 else { return false }
-        
-        currentTokenCount = Int32(initialCount)
+
         shouldContinuePredicting = true
         return true
+    }
+    
+    public func clearContext() throws {
+        tokenBuffer.removeAll()
+        currentTokenCount = 0
+        shouldContinuePredicting = false
+        
+        // Free old resources
+        llama_batch_free(batch)
+        llama_free(context)
+        
+        // Reinitialize context with same parameters
+        var contextParams = params
+        guard let newContext = llama_init_from_model(model, contextParams) else {
+            throw LLMError.contextCreationFailed
+        }
+        context = newContext
+        
+        // Initialize new batch
+        batch = llama_batch_init(Int32(maxTokenCount), 0, 1)
     }
     
     private func clearBatch() {
@@ -202,6 +253,8 @@ public actor LLMCore {
     
     private func addToBatch(token: Token, pos: Int32, isLogit: Bool = true) {
         let i = Int(batch.n_tokens)
+        guard i < maxTokenCount else { return }
+        
         batch.token[i] = token
         batch.pos[i] = pos
         batch.n_seq_id[i] = 1
@@ -222,6 +275,12 @@ public actor LLMCore {
         let i = batch.n_tokens - 1
         let token = llama_sampler_sample(sampler, context, i)
         llama_sampler_accept(sampler, token)
+        
+        // Check for -1 (error) and nullToken
+        if token == -1 || token == nullToken {
+            shouldContinuePredicting = false
+            return endToken
+        }
         
         tokenBuffer.append(token)
         
@@ -253,12 +312,27 @@ public actor LLMCore {
     func generateResponseStream(from input: String) -> AsyncStream<String> {
         return AsyncStream<String> { continuation in
             Task {
-                guard prepareContext(for: input) else { return continuation.finish() }
+                guard prepareContext(for: input) else {
+                    continuation.finish()
+                    return
+                }
                 if let sampler { llama_sampler_reset(sampler) }
                 
+                // FIXED: Add timeout mechanism
+                let startTime = Date()
+                let timeout: TimeInterval = 300 // 5 minutes
+                
                 while shouldContinuePredicting && currentTokenCount < Int32(maxTokenCount) {
+                    // Check timeout
+                    if Date().timeIntervalSince(startTime) > timeout {
+                        print("Warning: Generation timed out after \(timeout) seconds")
+                        break
+                    }
+                    
                     let token = predictNextToken()
-                    guard token != endToken else { return continuation.finish() }
+                    guard token != endToken else {
+                        break
+                    }
                     let word = decode(token)
                     continuation.yield(word)
                 }
@@ -311,15 +385,20 @@ public actor LLMCore {
     }
     
     private func extractEmbeddingsFromContext() throws -> [Float] {
-        guard let embeddingsPtr = llama_get_embeddings(context) else { throw LLMError.embeddingsFailed }
+        guard let embeddingsPtr = llama_get_embeddings(context) else {
+            throw LLMError.embeddingsFailed
+        }
         
         let embeddingDimension = Int(llama_model_n_embd(model))
+        guard embeddingDimension > 0 else {
+            throw LLMError.embeddingsFailed
+        }
+        
         var embeddingsArray: [Float] = []
         embeddingsArray.reserveCapacity(embeddingDimension)
         
-        for i in 0..<embeddingDimension {
-            embeddingsArray.append(embeddingsPtr[i])
-        }
+        let buffer = UnsafeBufferPointer(start: embeddingsPtr, count: embeddingDimension)
+        embeddingsArray.append(contentsOf: buffer)
         
         return embeddingsArray
     }
@@ -335,6 +414,8 @@ public actor LLMCore {
         if let sampler { llama_sampler_reset(sampler) }
         
         var output = ""
+        let startTime = Date()
+        let timeout: TimeInterval = 120 // 2 minutes for JSON generation
         
         try addToken("{", to: &output)
         
@@ -343,6 +424,11 @@ public actor LLMCore {
         }
         
         for (index, field) in parsedSchema.fields.enumerated() {
+            // Check timeout
+            if Date().timeIntervalSince(startTime) > timeout {
+                throw LLMError.generationTimeout
+            }
+            
             try addToken("\"\(field.name)\":", to: &output)
             
             try generateValueForField(field, into: &output, originalSchema: originalSchema, allowNull: !field.required)
@@ -405,7 +491,6 @@ public actor LLMCore {
         }
     }
     
-    
     private func addToken(_ token: Token, to output: inout String) throws {
         if let sampler {
             llama_sampler_accept(sampler, token)
@@ -428,7 +513,6 @@ public actor LLMCore {
         }
     }
 
-        
     private var _tokenSets: (stringTokens: Set<Token>, leadingWhitespaceTokens: Set<Token>)?
     private var tokenSets: (stringTokens: Set<Token>, leadingWhitespaceTokens: Set<Token>) {
         get {
@@ -442,7 +526,7 @@ public actor LLMCore {
             for i in 0..<totalTokenCount {
                 let token = Token(i)
                 let decoded = decode(token)
-                if decoded.isEmpty || decoded.contains(where: {  !$0.isValidStringCharacter }) { continue }
+                if decoded.isEmpty || decoded.contains(where: { !$0.isValidStringCharacter }) { continue }
                 if let firstChar = decoded.first, firstChar.isWhitespace {
                     leadingWhitespaceTokens.insert(token)
                 }
@@ -468,11 +552,17 @@ public actor LLMCore {
         let maxTokens = 128
         var tokensInString: [Token] = []
         var hasContent = false
+        let startTime = Date()
+        let timeout: TimeInterval = 30 // 30 seconds for string generation
         
         let (stringTokens, leadingWhitespaceTokens) = tokenSets
         
-        
         while tokensInString.count < maxTokens {
+            if Date().timeIntervalSince(startTime) > timeout {
+                print("Warning: String generation timed out")
+                break
+            }
+            
             var allowedTokens = stringTokens
             if hasContent {
                 allowedTokens.insert(quoteToken)
@@ -531,7 +621,7 @@ public actor LLMCore {
             
             candidateValues = candidateValues.filter { value in
                 let valueTokens = encode(value, shouldAddBOS: false, special: false)
-                return currentTokens.count <= valueTokens.count && 
+                return currentTokens.count <= valueTokens.count &&
                        Array(valueTokens.prefix(currentTokens.count)) == currentTokens
             }
         }
@@ -739,11 +829,18 @@ public actor LLMCore {
         
         let maxItems = 5
         var itemCount = 0
+        let startTime = Date()
+        let timeout: TimeInterval = 60 // 1 minute for array generation
         
         let closingBracketToken = encode("]", shouldAddBOS: false, special: false).first!
         let commaToken = encode(",", shouldAddBOS: false, special: false).first!
         
         while itemCount < maxItems {
+            if Date().timeIntervalSince(startTime) > timeout {
+                print("Warning: Array generation timed out")
+                break
+            }
+            
             switch itemType {
             case .string(let allowedValues):
                 try generateStringValue(into: &output, allowedValues: allowedValues)
@@ -832,7 +929,7 @@ public actor LLMCore {
                     guard let items = fieldInfo["items"] as? [String: Any],
                           let itemTypeString = items["type"] as? String else { continue }
                     switch itemTypeString {
-                    case "string": 
+                    case "string":
                         if let enumValues = items["enum"] as? [String] {
                             fieldType = .array(itemType: .string(allowedValues: enumValues))
                         } else {
@@ -920,6 +1017,8 @@ public enum LLMError: Error {
     case inputTooLong
     case decodeFailed
     case embeddingsFailed
+    case generationTimeout
+    case invalidParameters(String)
 }
 
 /// A container for text embeddings generated by the model.
@@ -998,7 +1097,7 @@ public enum StructuredOutputError: Error {
 /// - **Template Support**: Built-in chat templates for popular model formats
 /// - **Structured Output**: Generate JSON conforming to specified schemas
 open class LLM: ObservableObject {
-    private(set) var model: Model
+    private let model: Model
     public var history: [Chat]
     public var preprocess: @Sendable (_ input: String, _ history: [Chat]) -> String = { input, _ in return input }
     public var postprocess: @Sendable (_ output: String) -> Void = { print($0) }
@@ -1055,11 +1154,15 @@ open class LLM: ObservableObject {
     }
     
     public var historyLimit: Int
-    public var path: [CChar]
     
     public let core: LLMCore
-    private var isAvailable = true
-    private var input: String = ""
+    
+    private enum TaskState {
+        case idle
+        case generating
+    }
+    private var taskState: TaskState = .idle
+    private var currentTask: Task<Void, Never>?
     
     static var isLogSilenced = false
     static func silenceLogging() {
@@ -1069,7 +1172,6 @@ open class LLM: ObservableObject {
         llama_log_set(noopCallback, nil)
         ggml_log_set(noopCallback, nil)
     }
-    
     
     public init?(
         from path: String,
@@ -1082,10 +1184,17 @@ open class LLM: ObservableObject {
         repeatPenalty: Float = 1.2,
         repetitionLookback: Int32 = 64,
         historyLimit: Int = 8,
-        maxTokenCount: Int32 = 2048
+        maxTokenCount: Int32 = 2048,
+        nThreads: Int? = nil,
+        nThreadsBatch: Int? = nil,
+        n_gpu_layers: Int32? = nil
     ) {
         LLM.silenceLogging()
-        self.path = path.cString(using: .utf8)!
+        
+        guard maxTokenCount > 0, historyLimit >= 0 else {
+            return nil
+        }
+        
         self.seed = seed
         self.topK = topK
         self.topP = topP
@@ -1095,14 +1204,16 @@ open class LLM: ObservableObject {
         self.repeatPenalty = repeatPenalty
         self.repetitionLookback = repetitionLookback
         
-        #if DEBUG
-        print("GNERATING WITH SEEED: \(seed)")
-        #endif
         var modelParams = llama_model_default_params()
+        if let n_gpu_layers {
+            modelParams.n_gpu_layers = n_gpu_layers
+        }
         #if targetEnvironment(simulator)
         modelParams.n_gpu_layers = 0
         #endif
-        guard let model = llama_model_load_from_file(self.path, modelParams) else {
+        
+        let pathCString = path.cString(using: .utf8)!
+        guard let model = llama_model_load_from_file(pathCString, modelParams) else {
             return nil
         }
         self.model = model
@@ -1112,14 +1223,16 @@ open class LLM: ObservableObject {
         do {
             self.core = try LLMCore(
                 model: model,
-                path: self.path,
+                path: pathCString,
                 seed: seed,
                 topK: topK,
                 topP: topP,
                 temp: temp,
                 repeatPenalty: repeatPenalty,
                 repetitionLookback: repetitionLookback,
-                maxTokenCount: finalMaxTokenCount
+                maxTokenCount: finalMaxTokenCount,
+                nThreads: nThreads ?? ProcessInfo().processorCount,
+                nThreadsBatch: nThreadsBatch ?? ProcessInfo().processorCount
             )
             
             if let stopSequence {
@@ -1144,7 +1257,10 @@ open class LLM: ObservableObject {
         repeatPenalty: Float = 1.2,
         repetitionLookback: Int32 = 64,
         historyLimit: Int = 8,
-        maxTokenCount: Int32 = 2048
+        maxTokenCount: Int32 = 2048,
+        nThreads: Int? = nil,
+        nThreadsBatch: Int? = nil,
+        n_gpu_layers: Int32? = nil
     ) {
         self.init(
             from: url.path,
@@ -1157,7 +1273,10 @@ open class LLM: ObservableObject {
             repeatPenalty: repeatPenalty,
             repetitionLookback: repetitionLookback,
             historyLimit: historyLimit,
-            maxTokenCount: maxTokenCount
+            maxTokenCount: maxTokenCount,
+            nThreads: nThreads,
+            nThreadsBatch: nThreadsBatch,
+            n_gpu_layers: n_gpu_layers
         )
     }
     
@@ -1172,7 +1291,11 @@ open class LLM: ObservableObject {
         repeatPenalty: Float = 1.2,
         repetitionLookback: Int32 = 64,
         historyLimit: Int = 8,
-        maxTokenCount: Int32 = 2048
+        maxTokenCount: Int32 = 2048,
+        nThreads: Int? = nil,
+        nThreadsBatch: Int? = nil,
+        nBatch: Int = 16,
+        n_gpu_layers: Int32? = nil
     ) {
         self.init(
             from: url.path,
@@ -1185,7 +1308,10 @@ open class LLM: ObservableObject {
             repeatPenalty: repeatPenalty,
             repetitionLookback: repetitionLookback,
             historyLimit: historyLimit,
-            maxTokenCount: maxTokenCount
+            maxTokenCount: maxTokenCount,
+            nThreads: nThreads,
+            nThreadsBatch: nThreadsBatch,
+            n_gpu_layers: n_gpu_layers
         )
         self.preprocess = template.preprocess
         self.template = template
@@ -1204,6 +1330,9 @@ open class LLM: ObservableObject {
         repetitionLookback: Int32 = 64,
         historyLimit: Int = 8,
         maxTokenCount: Int32 = 2048,
+        nThreads: Int? = nil,
+        nThreadsBatch: Int? = nil,
+        nBatch: Int = 16,
         updateProgress: @Sendable @escaping (Double) -> Void = { print(String(format: "downloaded(%.2f%%)", $0 * 100)) }
     ) async throws {
         let url = try await huggingFaceModel.download(to: url, as: name) { progress in
@@ -1220,7 +1349,10 @@ open class LLM: ObservableObject {
             repeatPenalty: repeatPenalty,
             repetitionLookback: repetitionLookback,
             historyLimit: historyLimit,
-            maxTokenCount: maxTokenCount
+            maxTokenCount: maxTokenCount,
+            nThreads: nThreads,
+            nThreadsBatch: nThreadsBatch,
+            nBatch: nBatch
         )
     }
     
@@ -1228,25 +1360,41 @@ open class LLM: ObservableObject {
         llama_model_free(model)
     }
     
-    
-    @MainActor public func setOutput(to newOutput: consuming String) {
-        output = newOutput
-    }
-    
     public func stop() {
+        currentTask?.cancel()
         Task { await core.stopGeneration() }
     }
     
+    public func clearContext() {
+        output = ""
+        Task {
+            do {
+                try await core.clearContext()
+            } catch {
+                print("Failed to clear context: \(error)")
+            }
+        }
+    }
+    
+    public func clearHistory() {
+        history.removeAll()
+    }
+    
+    public func clearAll() {
+        clearHistory()
+        clearContext()
+    }
     
     open func recoverFromLengthy(_ input: borrowing String, to output: borrowing AsyncStream<String>.Continuation) {
         output.yield("TL;DR")
     }
     
     public func getCompletion(from input: borrowing String) async -> String {
-        guard isAvailable else { return "LLM is being used" }
+        // FIXED: Check task state instead of isAvailable boolean
+        guard taskState == .idle else { return "LLM is being used" }
         
-        isAvailable = false
-        defer { isAvailable = true }
+        taskState = .generating
+        defer { taskState = .idle }
         
         let response = await core.generateResponseStream(from: input)
         var output = ""
@@ -1258,41 +1406,59 @@ open class LLM: ObservableObject {
         return output
     }
     
+    private func addToHistory(user: String, bot: String) {
+        history.append((.user, user))
+        history.append((.bot, bot))
+        
+        // Keep only the most recent conversations within limit
+        while history.count > historyLimit * 2 {
+            history.removeFirst(2) // Remove user-bot pair
+        }
+    }
+    
     public func respond(to input: String, with makeOutputFrom: @escaping (AsyncStream<String>) async -> String) async {
-        guard isAvailable else { return }
-        
-        isAvailable = false
-        defer { isAvailable = true }
-        
-        self.input = input
-        let processedInput = preprocess(input, history)
-        let response = await core.generateResponseStream(from: processedInput)
-        let output = await makeOutputFrom(response)
-        
-        history += [(.user, input), (.bot, output)]
-        let historyCount = history.count
-        if historyLimit < historyCount {
-            history.removeFirst(min(2, historyCount))
+        guard taskState == .idle else {
+            print("Warning: LLM is already generating a response")
+            return
         }
         
-        postprocess(output)
+        taskState = .generating
+        defer { taskState = .idle }
+        
+        let processedInput = preprocess(input, history)
+        
+        let stream = await core.generateResponseStream(from: processedInput)
+
+        let task = Task {
+            let output = await makeOutputFrom(stream)
+            
+            self.addToHistory(user: input, bot: output)
+            
+            self.postprocess(output)
+        }
+        self.currentTask = task
+        await task.value
     }
     
     open func respond(to input: String) async {
         await respond(to: input) { [weak self] response in
             guard let self = self else { return "" }
             
-            await self.setOutput(to: "")
+            self.setOutput(to: "")
             for await responseDelta in response {
                 self.update(responseDelta)
-                await self.setOutput(to: self.output + responseDelta)
+                self.setOutput(to: self.output + responseDelta)
             }
             self.update(nil)
             
             let trimmedOutput = self.output.trimmingCharacters(in: .whitespacesAndNewlines)
-            await self.setOutput(to: trimmedOutput.isEmpty ? "..." : trimmedOutput)
+            self.setOutput(to: trimmedOutput.isEmpty ? "..." : trimmedOutput)
             return self.output
         }
+    }
+    
+    public func setOutput(to newOutput: String) {
+        output = newOutput
     }
     
     public func encode(_ text: borrowing String, shouldAddBOS: Bool = true) async -> [Token] {
@@ -1329,11 +1495,7 @@ open class LLM: ObservableObject {
         do {
             let decodedValue = try JSONDecoder().decode(T.self, from: jsonData)
             let output = StructuredOutput(value: decodedValue, rawOutput: rawOutput)
-            history += [(.user, processedPrompt), (.bot, rawOutput)]
-            let historyCount = history.count
-            if historyLimit < historyCount {
-                history.removeFirst(min(2, historyCount))
-            }
+            addToHistory(user: processedPrompt, bot: rawOutput)
             postprocess(rawOutput)
             return output
         } catch {
@@ -1505,7 +1667,7 @@ public struct HuggingFaceModel {
     public let template: Template
     public let filterRegexPattern: String
     
-    public init(_ name: String, template: Template, filterRegexPattern: String) {
+    public init(_ name: String, template: Template, filterRegexPattern: String = #"(?i)(?<!IQ|Q)\.gguf"#) {
         self.name = name
         self.template = template
         self.filterRegexPattern = filterRegexPattern
@@ -1630,4 +1792,11 @@ extension Character {
         guard self != "\"" && self != "\\" else { return false }
         return isLetter || self == " " || isNumber || isLowercase || isUppercase || isASCII && isPunctuation || isASCII && isSymbol
     }
+}
+
+// MARK: - Additional protocols and extensions needed for structured output
+
+/// Protocol for types that can be generated using structured output
+public protocol Generatable: Codable {
+    static var jsonSchema: String { get }
 }
