@@ -8,6 +8,77 @@ public enum ThinkingMode: Sendable {
     case enabled
 }
 
+public enum FlashAttentionMode: Int32, Sendable, CaseIterable {
+    case auto = -1
+    case disabled = 0
+    case enabled = 1
+}
+
+public enum PoolingType: Int32, Sendable, CaseIterable {
+    case none = 0
+    case mean = 1
+    case cls = 2
+    case last = 3
+    case rank = 4
+}
+
+public enum RoPEScalingType: Int32, Sendable, CaseIterable {
+    case none = 0
+    case linear = 1
+    case yarn = 2
+    case longRope = 3
+}
+
+public struct RoPEScalingConfig: Sendable {
+    public var type: RoPEScalingType = .none
+    public var factor: Float = 0.0
+    public var extFactor: Float = -1.0
+    public var attnFactor: Float = 1.0
+    public var betaFast: Float = 32.0
+    public var betaSlow: Float = 1.0
+    public var origCtx: UInt32 = 0
+    
+    public init(
+        type: RoPEScalingType = .none,
+        factor: Float = 0.0,
+        extFactor: Float = -1.0,
+        attnFactor: Float = 1.0,
+        betaFast: Float = 32.0,
+        betaSlow: Float = 1.0,
+        origCtx: UInt32 = 0
+    ) {
+        self.type = type
+        self.factor = factor
+        self.extFactor = extFactor
+        self.attnFactor = attnFactor
+        self.betaFast = betaFast
+        self.betaSlow = betaSlow
+        self.origCtx = origCtx
+    }
+}
+
+public struct SpeculativeConfig: Sendable {
+    public var draftModelPath: String
+    public var nMax: Int32 = 4
+    public var nMin: Int32 = 1
+    public var pMin: Float = 0.1
+    public var backendSampling: Bool = false
+    
+    public init(
+        draftModelPath: String,
+        nMax: Int32 = 4,
+        nMin: Int32 = 1,
+        pMin: Float = 0.1,
+        backendSampling: Bool = false
+    ) {
+        self.draftModelPath = draftModelPath
+        self.nMax = nMax
+        self.nMin = nMin
+        self.pMin = pMin
+        self.backendSampling = backendSampling
+    }
+}
+
 /// A token used by the language model.
 public typealias Token = llama_token
 
@@ -43,6 +114,19 @@ public actor LLMCore {
     private(set) var repeatPenalty: Float
     private(set) var repetitionLookback: Int32
     
+    // New sampling parameters
+    private(set) var minP: Float = 0.0
+    private(set) var typicalP: Float = 0.0
+    private(set) var xtcProbability: Float = 0.0
+    private(set) var xtcThreshold: Float = 0.0
+    private(set) var dryMultiplier: Float = 0.0
+    private(set) var dryBase: Float = 1.75
+    private(set) var dryAllowedLength: Int32 = 2
+    private(set) var dryPenaltyLastN: Int32 = -1
+    private(set) var mirostat: Int32 = 0
+    private(set) var mirostatTau: Float = 5.0
+    private(set) var mirostatEta: Float = 0.1
+    
     private let maxTokenCount: Int
     private let totalTokenCount: Int
     
@@ -71,16 +155,49 @@ public actor LLMCore {
     private var debugLastGeneratedTokens: [Token] = []
     
     private var sampler: UnsafeMutablePointer<llama_sampler>?
+    private var draftContext: OpaquePointer?
     
-    func setParameters(seed: UInt32? = nil, topK: Int32? = nil, topP: Float? = nil, temp: Float? = nil, repeatPenalty: Float? = nil, repetitionLookback: Int32? = nil) {
+    func setParameters(
+        seed: UInt32? = nil,
+        topK: Int32? = nil,
+        topP: Float? = nil,
+        temp: Float? = nil,
+        repeatPenalty: Float? = nil,
+        repetitionLookback: Int32? = nil,
+        minP: Float? = nil,
+        typicalP: Float? = nil,
+        xtcProbability: Float? = nil,
+        xtcThreshold: Float? = nil,
+        dryMultiplier: Float? = nil,
+        dryBase: Float? = nil,
+        dryAllowedLength: Int32? = nil,
+        dryPenaltyLastN: Int32? = nil,
+        mirostat: Int32? = nil,
+        mirostatTau: Float? = nil,
+        mirostatEta: Float? = nil
+    ) {
         if let seed { self.seed = seed }
         if let topK { self.topK = topK }
         if let topP { self.topP = topP }
         if let temp { self.temp = temp }
         if let repeatPenalty { self.repeatPenalty = repeatPenalty }
         if let repetitionLookback { self.repetitionLookback = repetitionLookback }
+        if let minP { self.minP = minP }
+        if let typicalP { self.typicalP = typicalP }
+        if let xtcProbability { self.xtcProbability = xtcProbability }
+        if let xtcThreshold { self.xtcThreshold = xtcThreshold }
+        if let dryMultiplier { self.dryMultiplier = dryMultiplier }
+        if let dryBase { self.dryBase = dryBase }
+        if let dryAllowedLength { self.dryAllowedLength = dryAllowedLength }
+        if let dryPenaltyLastN { self.dryPenaltyLastN = dryPenaltyLastN }
+        if let mirostat { self.mirostat = mirostat }
+        if let mirostatTau { self.mirostatTau = mirostatTau }
+        if let mirostatEta { self.mirostatEta = mirostatEta }
         
-        if seed != nil || topK != nil || topP != nil || temp != nil || repeatPenalty != nil || repetitionLookback != nil {
+        if seed != nil || topK != nil || topP != nil || temp != nil || repeatPenalty != nil || repetitionLookback != nil ||
+           minP != nil || typicalP != nil || xtcProbability != nil || xtcThreshold != nil ||
+           dryMultiplier != nil || dryBase != nil || dryAllowedLength != nil || dryPenaltyLastN != nil ||
+           mirostat != nil || mirostatTau != nil || mirostatEta != nil {
             recreateSampler()
         }
     }
@@ -109,13 +226,58 @@ public actor LLMCore {
         sampler = llama_sampler_chain_init(samplerParams)
         
         llama_sampler_chain_add(sampler!, llama_sampler_init_penalties(repetitionLookback, repeatPenalty, 0, 0))
-        llama_sampler_chain_add(sampler!, llama_sampler_init_top_k(topK))
-        llama_sampler_chain_add(sampler!, llama_sampler_init_top_p(topP, 1))
-        llama_sampler_chain_add(sampler!, llama_sampler_init_temp(temp))
+        
+        if mirostat > 0 {
+            if mirostat == 1 {
+                llama_sampler_chain_add(sampler!, llama_sampler_init_mirostat(Int32(totalTokenCount), seed, mirostatTau, mirostatEta, 100))
+            } else {
+                llama_sampler_chain_add(sampler!, llama_sampler_init_mirostat_v2(seed, mirostatTau, mirostatEta))
+            }
+        } else {
+            if minP > 0 {
+                llama_sampler_chain_add(sampler!, llama_sampler_init_min_p(minP, 1))
+            }
+            if typicalP > 0 {
+                llama_sampler_chain_add(sampler!, llama_sampler_init_typical(typicalP, 1))
+            }
+            if xtcProbability > 0 && xtcThreshold > 0 {
+                llama_sampler_chain_add(sampler!, llama_sampler_init_xtc(xtcProbability, xtcThreshold, 1, seed))
+            }
+            llama_sampler_chain_add(sampler!, llama_sampler_init_top_k(topK))
+            llama_sampler_chain_add(sampler!, llama_sampler_init_top_p(topP, 1))
+            if dryMultiplier > 0 {
+                llama_sampler_chain_add(sampler!, llama_sampler_init_dry(vocab, Int32(maxTokenCount), dryMultiplier, dryBase, dryAllowedLength, dryPenaltyLastN, nil, 0))
+            }
+            llama_sampler_chain_add(sampler!, llama_sampler_init_temp(temp))
+        }
         llama_sampler_chain_add(sampler!, llama_sampler_init_dist(seed))
     }
     
-    public init(model: Model, path: [CChar], seed: UInt32, topK: Int32, topP: Float, temp: Float, repeatPenalty: Float, repetitionLookback: Int32, maxTokenCount: Int) throws {
+    public init(
+        model: Model,
+        path: [CChar],
+        seed: UInt32,
+        topK: Int32,
+        topP: Float,
+        temp: Float,
+        repeatPenalty: Float,
+        repetitionLookback: Int32,
+        maxTokenCount: Int,
+        nBatch: UInt32? = nil,
+        nUbatch: UInt32? = nil,
+        nSeqMax: UInt32 = 1,
+        nRsSeq: UInt32 = 0,
+        nOutputsMax: UInt32 = 0,
+        flashAttention: FlashAttentionMode = .auto,
+        ropeScaling: RoPEScalingConfig? = nil,
+        poolingType: PoolingType = .none,
+        offloadKQV: Bool = true,
+        typeK: ggml_type = GGML_TYPE_Q8_0,
+        typeV: ggml_type = GGML_TYPE_Q8_0,
+        kvUnified: Bool = true,
+        swaFull: Bool = true,
+        defragThold: Float = -1.0
+    ) throws {
         LLM.ensureInitialized()
         self.model = model
         self.vocab = llama_model_get_vocab(model)
@@ -131,10 +293,34 @@ public actor LLMCore {
         var contextParams = llama_context_default_params()
         let processorCount = Int32(ProcessInfo().processorCount)
         contextParams.n_ctx = UInt32(maxTokenCount)
-        contextParams.n_batch = contextParams.n_ctx
+        contextParams.n_batch = nBatch ?? UInt32(maxTokenCount)
+        contextParams.n_ubatch = nUbatch ?? 512
         contextParams.n_threads = processorCount
         contextParams.n_threads_batch = processorCount
+        contextParams.n_seq_max = nSeqMax
+        contextParams.n_rs_seq = nRsSeq
+        contextParams.n_outputs_max = nOutputsMax == 0 ? (nBatch ?? UInt32(maxTokenCount)) : nOutputsMax
         contextParams.embeddings = true
+        contextParams.offload_kqv = offloadKQV
+        contextParams.flash_attn_type = llama_flash_attn_type(flashAttention.rawValue)
+        contextParams.type_k = typeK
+        contextParams.type_v = typeV
+        contextParams.kv_unified = kvUnified
+        contextParams.swa_full = swaFull
+        contextParams.defrag_thold = defragThold
+        
+        if let ropeScaling {
+            contextParams.rope_scaling_type = llama_rope_scaling_type(ropeScaling.type.rawValue)
+            contextParams.rope_freq_scale = ropeScaling.factor
+            contextParams.yarn_ext_factor = ropeScaling.extFactor
+            contextParams.yarn_attn_factor = ropeScaling.attnFactor
+            contextParams.yarn_beta_fast = ropeScaling.betaFast
+            contextParams.yarn_beta_slow = ropeScaling.betaSlow
+            contextParams.yarn_orig_ctx = ropeScaling.origCtx
+        }
+        
+        contextParams.pooling_type = llama_pooling_type(poolingType.rawValue)
+        
         self.params = contextParams
         
         guard let context = llama_init_from_model(model, params) else {
@@ -142,7 +328,7 @@ public actor LLMCore {
         }
         self.context = context
         
-        self.batch = llama_batch_init(Int32(maxTokenCount), 0, 1)
+        self.batch = llama_batch_init(Int32(maxTokenCount), 0, Int32(nSeqMax))
         
         recreateSampler()
     }
@@ -150,10 +336,82 @@ public actor LLMCore {
     deinit {
         llama_batch_free(batch)
         llama_free(context)
+        if let draftContext {
+            llama_free(draftContext)
+        }
         if let sampler {
             llama_sampler_free(sampler)
         }
         llama_model_free(model)
+    }
+    
+    public static func createWithSpeculativeDecoding(
+        model: Model,
+        draftModel: Model,
+        path: [CChar],
+        seed: UInt32,
+        topK: Int32,
+        topP: Float,
+        temp: Float,
+        repeatPenalty: Float,
+        repetitionLookback: Int32,
+        maxTokenCount: Int,
+        speculative: SpeculativeConfig
+    ) async throws -> LLMCore {
+        let core = try LLMCore(
+            model: model,
+            path: path,
+            seed: seed,
+            topK: topK,
+            topP: topP,
+            temp: temp,
+            repeatPenalty: repeatPenalty,
+            repetitionLookback: repetitionLookback,
+            maxTokenCount: maxTokenCount,
+            nBatch: nil,
+            nUbatch: nil,
+            nSeqMax: 1,
+            nRsSeq: 0,
+            nOutputsMax: 0,
+            flashAttention: .auto,
+            ropeScaling: nil,
+            poolingType: .none,
+            offloadKQV: true,
+            typeK: GGML_TYPE_Q8_0,
+            typeV: GGML_TYPE_Q8_0,
+            kvUnified: true,
+            swaFull: true,
+            defragThold: -1.0
+        )
+        
+        // Initialize draft model context for speculative decoding
+        var draftContextParams = llama_context_default_params()
+        let processorCount = Int32(ProcessInfo().processorCount)
+        draftContextParams.n_ctx = UInt32(maxTokenCount)
+        draftContextParams.n_batch = UInt32(maxTokenCount)
+        draftContextParams.n_ubatch = 512
+        draftContextParams.n_threads = processorCount
+        draftContextParams.n_threads_batch = processorCount
+        draftContextParams.n_seq_max = 1
+        draftContextParams.embeddings = false
+        draftContextParams.ctx_type = LLAMA_CONTEXT_TYPE_MTP
+        draftContextParams.ctx_other = await core.getContext()
+        
+        guard let draftCtx = llama_init_from_model(draftModel, draftContextParams) else {
+            throw LLMError.contextCreationFailed
+        }
+        
+        await core.setDraftContext(draftCtx)
+        return core
+    }
+    
+    // Helper for speculative decoding
+    func getContext() -> OpaquePointer {
+        return context
+    }
+    
+    func setDraftContext(_ ctx: OpaquePointer) {
+        draftContext = ctx
     }
     
     
@@ -1246,6 +1504,69 @@ open class LLM: ObservableObject {
         }
     }
     
+    // New sampling parameters
+    public var minP: Float = 0.0 {
+        didSet { Task { await core.setParameters(minP: minP) } }
+    }
+    
+    public var typicalP: Float = 0.0 {
+        didSet { Task { await core.setParameters(typicalP: typicalP) } }
+    }
+    
+    public var xtcProbability: Float = 0.0 {
+        didSet { Task { await core.setParameters(xtcProbability: xtcProbability) } }
+    }
+    
+    public var xtcThreshold: Float = 0.0 {
+        didSet { Task { await core.setParameters(xtcThreshold: xtcThreshold) } }
+    }
+    
+    public var dryMultiplier: Float = 0.0 {
+        didSet { Task { await core.setParameters(dryMultiplier: dryMultiplier) } }
+    }
+    
+    public var dryBase: Float = 1.75 {
+        didSet { Task { await core.setParameters(dryBase: dryBase) } }
+    }
+    
+    public var dryAllowedLength: Int32 = 2 {
+        didSet { Task { await core.setParameters(dryAllowedLength: dryAllowedLength) } }
+    }
+    
+    public var dryPenaltyLastN: Int32 = -1 {
+        didSet { Task { await core.setParameters(dryPenaltyLastN: dryPenaltyLastN) } }
+    }
+    
+    public var mirostat: Int32 = 0 {
+        didSet { Task { await core.setParameters(mirostat: mirostat) } }
+    }
+    
+    public var mirostatTau: Float = 5.0 {
+        didSet { Task { await core.setParameters(mirostatTau: mirostatTau) } }
+    }
+    
+    public var mirostatEta: Float = 0.1 {
+        didSet { Task { await core.setParameters(mirostatEta: mirostatEta) } }
+    }
+    
+    // Context configuration
+    public var flashAttention: FlashAttentionMode = .auto
+    public var ropeScaling: RoPEScalingConfig?
+    public var poolingType: PoolingType = .none
+    public var offloadKQV: Bool = true
+    public var kvUnified: Bool = true
+    public var swaFull: Bool = true
+    public var defragThold: Float = -1.0
+    public var typeK: ggml_type = GGML_TYPE_Q8_0
+    public var typeV: ggml_type = GGML_TYPE_Q8_0
+    public var nUbatch: UInt32 = 512
+    public var nSeqMax: UInt32 = 1
+    public var nRsSeq: UInt32 = 0
+    public var nOutputsMax: UInt32 = 0
+    
+    // Speculative decoding
+    public var speculativeConfig: SpeculativeConfig?
+    
     public var historyLimit: Int
     public var path: [CChar]
     
@@ -1285,7 +1606,33 @@ open class LLM: ObservableObject {
         repeatPenalty: Float = 1.2,
         repetitionLookback: Int32 = 64,
         historyLimit: Int = 8,
-        maxTokenCount: Int32 = 2048
+        maxTokenCount: Int32 = 2048,
+        nBatch: UInt32? = nil,
+        nUbatch: UInt32? = nil,
+        nSeqMax: UInt32 = 1,
+        nRsSeq: UInt32 = 0,
+        nOutputsMax: UInt32 = 0,
+        flashAttention: FlashAttentionMode = .auto,
+        ropeScaling: RoPEScalingConfig? = nil,
+        poolingType: PoolingType = .none,
+        offloadKQV: Bool = true,
+        typeK: ggml_type = GGML_TYPE_Q8_0,
+        typeV: ggml_type = GGML_TYPE_Q8_0,
+        kvUnified: Bool = true,
+        swaFull: Bool = true,
+        defragThold: Float = -1.0,
+        minP: Float = 0.0,
+        typicalP: Float = 0.0,
+        xtcProbability: Float = 0.0,
+        xtcThreshold: Float = 0.0,
+        dryMultiplier: Float = 0.0,
+        dryBase: Float = 1.75,
+        dryAllowedLength: Int32 = 2,
+        dryPenaltyLastN: Int32 = -1,
+        mirostat: Int32 = 0,
+        mirostatTau: Float = 5.0,
+        mirostatEta: Float = 0.1,
+        speculativeConfig: SpeculativeConfig? = nil
     ) {
         LLM.silenceLogging()
         self.path = path.cString(using: .utf8)!
@@ -1297,6 +1644,31 @@ open class LLM: ObservableObject {
         self.history = history
         self.repeatPenalty = repeatPenalty
         self.repetitionLookback = repetitionLookback
+        self.minP = minP
+        self.typicalP = typicalP
+        self.xtcProbability = xtcProbability
+        self.xtcThreshold = xtcThreshold
+        self.dryMultiplier = dryMultiplier
+        self.dryBase = dryBase
+        self.dryAllowedLength = dryAllowedLength
+        self.dryPenaltyLastN = dryPenaltyLastN
+        self.mirostat = mirostat
+        self.mirostatTau = mirostatTau
+        self.mirostatEta = mirostatEta
+        self.flashAttention = flashAttention
+        self.ropeScaling = ropeScaling
+        self.poolingType = poolingType
+        self.offloadKQV = offloadKQV
+        self.kvUnified = kvUnified
+        self.swaFull = swaFull
+        self.defragThold = defragThold
+        self.typeK = typeK
+        self.typeV = typeV
+        self.nUbatch = nUbatch ?? 512
+        self.nSeqMax = nSeqMax
+        self.nRsSeq = nRsSeq
+        self.nOutputsMax = nOutputsMax
+        self.speculativeConfig = speculativeConfig
         
         #if DEBUG
         print("GNERATING WITH SEEED: \(seed)")
@@ -1322,7 +1694,21 @@ open class LLM: ObservableObject {
                 temp: temp,
                 repeatPenalty: repeatPenalty,
                 repetitionLookback: repetitionLookback,
-                maxTokenCount: finalMaxTokenCount
+                maxTokenCount: finalMaxTokenCount,
+                nBatch: nBatch,
+                nUbatch: nUbatch,
+                nSeqMax: nSeqMax,
+                nRsSeq: nRsSeq,
+                nOutputsMax: nOutputsMax,
+                flashAttention: flashAttention,
+                ropeScaling: ropeScaling,
+                poolingType: poolingType,
+                offloadKQV: offloadKQV,
+                typeK: typeK,
+                typeV: typeV,
+                kvUnified: kvUnified,
+                swaFull: swaFull,
+                defragThold: defragThold
             )
             
             if let stopSequence {
@@ -1347,7 +1733,33 @@ open class LLM: ObservableObject {
         repeatPenalty: Float = 1.2,
         repetitionLookback: Int32 = 64,
         historyLimit: Int = 8,
-        maxTokenCount: Int32 = 2048
+        maxTokenCount: Int32 = 2048,
+        nBatch: UInt32? = nil,
+        nUbatch: UInt32? = nil,
+        nSeqMax: UInt32 = 1,
+        nRsSeq: UInt32 = 0,
+        nOutputsMax: UInt32 = 0,
+        flashAttention: FlashAttentionMode = .auto,
+        ropeScaling: RoPEScalingConfig? = nil,
+        poolingType: PoolingType = .none,
+        offloadKQV: Bool = true,
+        typeK: ggml_type = GGML_TYPE_Q8_0,
+        typeV: ggml_type = GGML_TYPE_Q8_0,
+        kvUnified: Bool = true,
+        swaFull: Bool = true,
+        defragThold: Float = -1.0,
+        minP: Float = 0.0,
+        typicalP: Float = 0.0,
+        xtcProbability: Float = 0.0,
+        xtcThreshold: Float = 0.0,
+        dryMultiplier: Float = 0.0,
+        dryBase: Float = 1.75,
+        dryAllowedLength: Int32 = 2,
+        dryPenaltyLastN: Int32 = -1,
+        mirostat: Int32 = 0,
+        mirostatTau: Float = 5.0,
+        mirostatEta: Float = 0.1,
+        speculativeConfig: SpeculativeConfig? = nil
     ) {
         self.init(
             from: url.path,
@@ -1360,7 +1772,33 @@ open class LLM: ObservableObject {
             repeatPenalty: repeatPenalty,
             repetitionLookback: repetitionLookback,
             historyLimit: historyLimit,
-            maxTokenCount: maxTokenCount
+            maxTokenCount: maxTokenCount,
+            nBatch: nBatch,
+            nUbatch: nUbatch,
+            nSeqMax: nSeqMax,
+            nRsSeq: nRsSeq,
+            nOutputsMax: nOutputsMax,
+            flashAttention: flashAttention,
+            ropeScaling: ropeScaling,
+            poolingType: poolingType,
+            offloadKQV: offloadKQV,
+            typeK: typeK,
+            typeV: typeV,
+            kvUnified: kvUnified,
+            swaFull: swaFull,
+            defragThold: defragThold,
+            minP: minP,
+            typicalP: typicalP,
+            xtcProbability: xtcProbability,
+            xtcThreshold: xtcThreshold,
+            dryMultiplier: dryMultiplier,
+            dryBase: dryBase,
+            dryAllowedLength: dryAllowedLength,
+            dryPenaltyLastN: dryPenaltyLastN,
+            mirostat: mirostat,
+            mirostatTau: mirostatTau,
+            mirostatEta: mirostatEta,
+            speculativeConfig: speculativeConfig
         )
     }
     
@@ -1375,7 +1813,33 @@ open class LLM: ObservableObject {
         repeatPenalty: Float = 1.2,
         repetitionLookback: Int32 = 64,
         historyLimit: Int = 8,
-        maxTokenCount: Int32 = 2048
+        maxTokenCount: Int32 = 2048,
+        nBatch: UInt32? = nil,
+        nUbatch: UInt32? = nil,
+        nSeqMax: UInt32 = 1,
+        nRsSeq: UInt32 = 0,
+        nOutputsMax: UInt32 = 0,
+        flashAttention: FlashAttentionMode = .auto,
+        ropeScaling: RoPEScalingConfig? = nil,
+        poolingType: PoolingType = .none,
+        offloadKQV: Bool = true,
+        typeK: ggml_type = GGML_TYPE_Q8_0,
+        typeV: ggml_type = GGML_TYPE_Q8_0,
+        kvUnified: Bool = true,
+        swaFull: Bool = true,
+        defragThold: Float = -1.0,
+        minP: Float = 0.0,
+        typicalP: Float = 0.0,
+        xtcProbability: Float = 0.0,
+        xtcThreshold: Float = 0.0,
+        dryMultiplier: Float = 0.0,
+        dryBase: Float = 1.75,
+        dryAllowedLength: Int32 = 2,
+        dryPenaltyLastN: Int32 = -1,
+        mirostat: Int32 = 0,
+        mirostatTau: Float = 5.0,
+        mirostatEta: Float = 0.1,
+        speculativeConfig: SpeculativeConfig? = nil
     ) {
         self.init(
             from: url.path,
@@ -1388,7 +1852,33 @@ open class LLM: ObservableObject {
             repeatPenalty: repeatPenalty,
             repetitionLookback: repetitionLookback,
             historyLimit: historyLimit,
-            maxTokenCount: maxTokenCount
+            maxTokenCount: maxTokenCount,
+            nBatch: nBatch,
+            nUbatch: nUbatch,
+            nSeqMax: nSeqMax,
+            nRsSeq: nRsSeq,
+            nOutputsMax: nOutputsMax,
+            flashAttention: flashAttention,
+            ropeScaling: ropeScaling,
+            poolingType: poolingType,
+            offloadKQV: offloadKQV,
+            typeK: typeK,
+            typeV: typeV,
+            kvUnified: kvUnified,
+            swaFull: swaFull,
+            defragThold: defragThold,
+            minP: minP,
+            typicalP: typicalP,
+            xtcProbability: xtcProbability,
+            xtcThreshold: xtcThreshold,
+            dryMultiplier: dryMultiplier,
+            dryBase: dryBase,
+            dryAllowedLength: dryAllowedLength,
+            dryPenaltyLastN: dryPenaltyLastN,
+            mirostat: mirostat,
+            mirostatTau: mirostatTau,
+            mirostatEta: mirostatEta,
+            speculativeConfig: speculativeConfig
         )
         self.preprocess = template.preprocess
         self.template = template
@@ -1407,6 +1897,32 @@ open class LLM: ObservableObject {
         repetitionLookback: Int32 = 64,
         historyLimit: Int = 8,
         maxTokenCount: Int32 = 2048,
+        nBatch: UInt32? = nil,
+        nUbatch: UInt32? = nil,
+        nSeqMax: UInt32 = 1,
+        nRsSeq: UInt32 = 0,
+        nOutputsMax: UInt32 = 0,
+        flashAttention: FlashAttentionMode = .auto,
+        ropeScaling: RoPEScalingConfig? = nil,
+        poolingType: PoolingType = .none,
+        offloadKQV: Bool = true,
+        typeK: ggml_type = GGML_TYPE_Q8_0,
+        typeV: ggml_type = GGML_TYPE_Q8_0,
+        kvUnified: Bool = true,
+        swaFull: Bool = true,
+        defragThold: Float = -1.0,
+        minP: Float = 0.0,
+        typicalP: Float = 0.0,
+        xtcProbability: Float = 0.0,
+        xtcThreshold: Float = 0.0,
+        dryMultiplier: Float = 0.0,
+        dryBase: Float = 1.75,
+        dryAllowedLength: Int32 = 2,
+        dryPenaltyLastN: Int32 = -1,
+        mirostat: Int32 = 0,
+        mirostatTau: Float = 5.0,
+        mirostatEta: Float = 0.1,
+        speculativeConfig: SpeculativeConfig? = nil,
         updateProgress: @Sendable @escaping (Double) -> Void = { print(String(format: "downloaded(%.2f%%)", $0 * 100)) }
     ) async throws {
         let url = try await huggingFaceModel.download(to: url, as: name) { progress in
@@ -1423,7 +1939,33 @@ open class LLM: ObservableObject {
             repeatPenalty: repeatPenalty,
             repetitionLookback: repetitionLookback,
             historyLimit: historyLimit,
-            maxTokenCount: maxTokenCount
+            maxTokenCount: maxTokenCount,
+            nBatch: nBatch,
+            nUbatch: nUbatch,
+            nSeqMax: nSeqMax,
+            nRsSeq: nRsSeq,
+            nOutputsMax: nOutputsMax,
+            flashAttention: flashAttention,
+            ropeScaling: ropeScaling,
+            poolingType: poolingType,
+            offloadKQV: offloadKQV,
+            typeK: typeK,
+            typeV: typeV,
+            kvUnified: kvUnified,
+            swaFull: swaFull,
+            defragThold: defragThold,
+            minP: minP,
+            typicalP: typicalP,
+            xtcProbability: xtcProbability,
+            xtcThreshold: xtcThreshold,
+            dryMultiplier: dryMultiplier,
+            dryBase: dryBase,
+            dryAllowedLength: dryAllowedLength,
+            dryPenaltyLastN: dryPenaltyLastN,
+            mirostat: mirostat,
+            mirostatTau: mirostatTau,
+            mirostatEta: mirostatEta,
+            speculativeConfig: speculativeConfig
         )
         await setupThinkingTokens(from: huggingFaceModel.template)
     }
@@ -1845,6 +2387,17 @@ public struct HuggingFaceModel {
         guard !destination.exists else { return destination }
         try await downloadURL.downloadData(to: destination, updateProgress)
         return destination
+    }
+    
+    public func downloadDraftModel(
+        draftName: String,
+        draftQuantization: Quantization? = .Q4_K_M,
+        to directory: URL = .documentsDirectory,
+        as name: String? = nil,
+        _ updateProgress: @Sendable @escaping (Double) -> Void
+    ) async throws -> URL {
+        let draftModel = HuggingFaceModel(draftName, draftQuantization, template: self.template)
+        return try await draftModel.download(to: directory, as: name, updateProgress)
     }
     
     public static func tinyLLaMA(_ quantization: Quantization = .Q4_K_M, _ systemPrompt: String) -> HuggingFaceModel {
